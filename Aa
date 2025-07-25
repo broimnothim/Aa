@@ -5,10 +5,10 @@ local RunService = game:GetService("RunService")
 -- Configuration
 local RECALCULATE_INTERVAL = 1.5  -- Seconds between path recalculations
 local TARGET_REACH_DISTANCE = 8   -- Distance to consider target reached
-local WAYPOINT_REACH_DISTANCE = 3 -- Distance to consider waypoint reached
-local MAX_WAYPOINT_TIME = 3       -- Max seconds to spend on one waypoint
-local PREDICTION_FACTOR = 0.5     -- Target position prediction (0-1)
+local WAYPOINT_REACH_DISTANCE = 4 -- Distance to consider waypoint reached
+local PREDICTION_FACTOR = 0.7     -- Target position prediction (0-1)
 local DEBUG_VISUAL = true         -- Set to false to disable path visualization
+local MOVEMENT_SMOOTHING = 0.2    -- Smoothing factor for movement transitions (0-1)
 
 -- Pathfinder state
 local active = false
@@ -19,6 +19,9 @@ local currentPath = {}
 local currentWaypointIndex = 1
 local lastRecalculation = 0
 local lastTargetPosition = Vector3.new(0, 0, 0)
+local isMoving = false
+local movementGoal = nil
+local movementStartTime = 0
 
 -- Clear visualization
 local function clearVisualization()
@@ -37,11 +40,11 @@ local function visualizePath(pathWaypoints)
     
     for i, waypoint in ipairs(pathWaypoints) do
         local part = Instance.new("Part")
-        part.Size = Vector3.new(0.5, 0.5, 0.5)
+        part.Size = Vector3.new(0.6, 0.6, 0.6)
         part.Position = waypoint.Position
         part.Anchored = true
         part.CanCollide = false
-        part.Transparency = 0.5
+        part.Transparency = 0.4
         part.Material = Enum.Material.Neon
         
         if waypoint.Action == Enum.PathWaypointAction.Jump then
@@ -55,40 +58,65 @@ local function visualizePath(pathWaypoints)
         
         -- Add label for waypoint number
         local billboard = Instance.new("BillboardGui")
-        billboard.Size = UDim2.new(2, 0, 2, 0)
+        billboard.Size = UDim2.new(3, 0, 3, 0)
         billboard.AlwaysOnTop = true
         billboard.Adornee = part
         
         local label = Instance.new("TextLabel")
         label.Size = UDim2.new(1, 0, 1, 0)
         label.Text = tostring(i)
-        label.TextScaled = true
+        label.Font = Enum.Font.SciFi
+        label.TextSize = 18
         label.BackgroundTransparency = 1
         label.TextColor3 = Color3.new(1, 1, 1)
+        label.TextStrokeTransparency = 0.5
         label.Parent = billboard
         
         billboard.Parent = part
     end
 end
 
--- Smooth movement function
-local function moveToWaypoint(humanoid, position, jump)
-    humanoid:MoveTo(position)
+-- Continuous movement function
+local function updateMovement(humanoid, rootPart, targetPosition)
+    if not active or not humanoid or not rootPart then return end
     
-    -- Check if we need to jump
-    if jump then
-        humanoid.Jump = true
+    -- Only update if we have a new goal or we're close to current goal
+    if not movementGoal or (movementGoal - rootPart.Position).Magnitude < WAYPOINT_REACH_DISTANCE then
+        movementGoal = targetPosition
+        movementStartTime = tick()
+        humanoid:MoveTo(targetPosition)
     end
     
-    -- Wait until reached or timeout
-    local startTime = tick()
-    while active and tick() - startTime < MAX_WAYPOINT_TIME do
-        if (position - humanoid.RootPart.Position).Magnitude < WAYPOINT_REACH_DISTANCE then
-            return true
+    -- Apply movement smoothing
+    if MOVEMENT_SMOOTHING > 0 then
+        local currentPosition = rootPart.Position
+        local direction = (movementGoal - currentPosition).Unit
+        local distance = (movementGoal - currentPosition).Magnitude
+        
+        -- Only apply smoothing when we're not too close
+        if distance > WAYPOINT_REACH_DISTANCE * 2 then
+            local smoothedGoal = currentPosition + (direction * distance * MOVEMENT_SMOOTHING)
+            humanoid:MoveTo(smoothedGoal)
         end
-        task.wait(0.1)
     end
-    return false
+    
+    -- Handle jumps at waypoints
+    for _, waypoint in ipairs(currentPath) do
+        if waypoint.Action == Enum.PathWaypointAction.Jump then
+            local distanceToJump = (waypoint.Position - rootPart.Position).Magnitude
+            if distanceToJump < WAYPOINT_REACH_DISTANCE * 1.5 then
+                humanoid.Jump = true
+            end
+        end
+    end
+    
+    -- Check if stuck
+    if tick() - movementStartTime > 2 and (movementGoal - rootPart.Position).Magnitude > WAYPOINT_REACH_DISTANCE then
+        humanoid.Jump = true
+        task.wait(0.1)
+        humanoid.Jump = true
+        movementGoal = nil -- Force new movement command
+    end
 end
 
 -- Predictive path calculation
@@ -99,11 +127,11 @@ local function calculatePredictivePath(rootPart, targetRoot)
     
     -- Create path
     local path = PathfindingService:CreatePath({
-        AgentRadius = 2,
+        AgentRadius = 2.5,
         AgentHeight = 5,
         AgentCanJump = true,
         AgentCanClimb = true,
-        WaypointSpacing = 8,  -- Larger spacing for smoother paths
+        WaypointSpacing = 6,  -- Larger spacing for smoother paths
         Cost = {}
     })
     
@@ -121,6 +149,49 @@ local function calculatePredictivePath(rootPart, targetRoot)
     end
     
     return nil
+end
+
+-- Path recalculation thread
+local function startPathRecalculationThread(rootPart, targetRoot)
+    while active and task.wait(RECALCULATE_INTERVAL) do
+        if not active then break end
+        
+        -- Skip if target hasn't moved significantly
+        local targetMoved = (lastTargetPosition - targetRoot.Position).Magnitude > 5
+        if not targetMoved and #currentPath > 0 then
+            -- Advance to next waypoint if we're close to current
+            if currentWaypointIndex <= #currentPath then
+                local waypoint = currentPath[currentWaypointIndex]
+                if (waypoint.Position - rootPart.Position).Magnitude < WAYPOINT_REACH_DISTANCE * 1.5 then
+                    currentWaypointIndex = math.min(currentWaypointIndex + 1, #currentPath)
+                end
+            end
+            continue
+        end
+        
+        -- Recalculate path
+        lastTargetPosition = targetRoot.Position
+        local newWaypoints = calculatePredictivePath(rootPart, targetRoot)
+        
+        if newWaypoints and #newWaypoints > 0 then
+            currentPath = newWaypoints
+            visualizePath(currentPath)
+            
+            -- Find the closest waypoint in the new path
+            local closestIndex = 1
+            local closestDist = math.huge
+            for i, waypoint in ipairs(currentPath) do
+                local dist = (waypoint.Position - rootPart.Position).Magnitude
+                if dist < closestDist then
+                    closestDist = dist
+                    closestIndex = i
+                end
+            end
+            
+            -- Skip ahead to the closest waypoint
+            currentWaypointIndex = math.min(closestIndex, #currentPath)
+        end
+    end
 end
 
 -- Start pathfinding to a player
@@ -157,8 +228,15 @@ local function followPlayer(playerName)
     currentWaypointIndex = 1
     lastRecalculation = 0
     lastTargetPosition = Vector3.new(0, 0, 0)
+    movementGoal = nil
     
-    connection = RunService.Heartbeat:Connect(function(deltaTime)
+    -- Start path recalculation in separate thread
+    task.spawn(function()
+        startPathRecalculationThread(rootPart, targetPlayer.Character:WaitForChild("HumanoidRootPart"))
+    end)
+    
+    -- Main movement loop
+    connection = RunService.Heartbeat:Connect(function()
         if not active then return end
         if not humanoid or humanoid.Health <= 0 then 
             active = false
@@ -181,48 +259,17 @@ local function followPlayer(playerName)
         -- Check if we've reached the target
         local distanceToTarget = (targetRoot.Position - rootPart.Position).Magnitude
         if distanceToTarget < TARGET_REACH_DISTANCE then
-            humanoid:MoveTo(targetRoot.Position)
+            updateMovement(humanoid, rootPart, targetRoot.Position)
             return
         end
         
-        -- Check if we need to recalculate the path
-        local now = tick()
-        local targetMoved = (lastTargetPosition - targetRoot.Position).Magnitude > 5
-        if #currentPath == 0 or now - lastRecalculation > RECALCULATE_INTERVAL or targetMoved then
-            -- Recalculate path
-            lastRecalculation = now
-            lastTargetPosition = targetRoot.Position
-            
-            local newWaypoints = calculatePredictivePath(rootPart, targetRoot)
-            
-            if newWaypoints and #newWaypoints > 0 then
-                currentPath = newWaypoints
-                currentWaypointIndex = 1
-                visualizePath(currentPath)
-                
-                -- Skip waypoints we've already passed
-                while currentWaypointIndex <= #currentPath do
-                    local waypoint = currentPath[currentWaypointIndex]
-                    if (waypoint.Position - rootPart.Position).Magnitude < (WAYPOINT_REACH_DISTANCE * 2) then
-                        currentWaypointIndex += 1
-                    else
-                        break
-                    end
-                end
-            end
-        end
-        
-        -- Follow current waypoint
-        if currentWaypointIndex <= #currentPath then
+        -- Follow current path if available
+        if #currentPath > 0 and currentWaypointIndex <= #currentPath then
             local waypoint = currentPath[currentWaypointIndex]
-            local reached = moveToWaypoint(humanoid, waypoint.Position, waypoint.Action == Enum.PathWaypointAction.Jump)
-            
-            if reached or (waypoint.Position - rootPart.Position).Magnitude < WAYPOINT_REACH_DISTANCE then
-                currentWaypointIndex += 1
-            end
+            updateMovement(humanoid, rootPart, waypoint.Position)
         else
             -- Move directly if we have no path
-            humanoid:MoveTo(targetRoot.Position)
+            updateMovement(humanoid, rootPart, targetRoot.Position)
         end
     end)
     
@@ -243,5 +290,6 @@ end
 return {
     follow = followPlayer,
     stop = stopFollowing,
-    toggleDebug = function() DEBUG_VISUAL = not DEBUG_VISUAL end
+    toggleDebug = function() DEBUG_VISUAL = not DEBUG_VISUAL end,
+    setSmoothing = function(value) MOVEMENT_SMOOTHING = math.clamp(value, 0, 1) end
 }
