@@ -1,0 +1,247 @@
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+
+-- Configuration
+local RECALCULATE_INTERVAL = 1.5  -- Seconds between path recalculations
+local TARGET_REACH_DISTANCE = 8   -- Distance to consider target reached
+local WAYPOINT_REACH_DISTANCE = 3 -- Distance to consider waypoint reached
+local MAX_WAYPOINT_TIME = 3       -- Max seconds to spend on one waypoint
+local PREDICTION_FACTOR = 0.5     -- Target position prediction (0-1)
+local DEBUG_VISUAL = true         -- Set to false to disable path visualization
+
+-- Pathfinder state
+local active = false
+local connection = nil
+local debugParts = {}
+local targetPlayer = nil
+local currentPath = {}
+local currentWaypointIndex = 1
+local lastRecalculation = 0
+local lastTargetPosition = Vector3.new(0, 0, 0)
+
+-- Clear visualization
+local function clearVisualization()
+    for _, part in ipairs(debugParts) do
+        if part and part.Parent then
+            part:Destroy()
+        end
+    end
+    debugParts = {}
+end
+
+-- Create visualization for path
+local function visualizePath(pathWaypoints)
+    if not DEBUG_VISUAL then return end
+    clearVisualization()
+    
+    for i, waypoint in ipairs(pathWaypoints) do
+        local part = Instance.new("Part")
+        part.Size = Vector3.new(0.5, 0.5, 0.5)
+        part.Position = waypoint.Position
+        part.Anchored = true
+        part.CanCollide = false
+        part.Transparency = 0.5
+        part.Material = Enum.Material.Neon
+        
+        if waypoint.Action == Enum.PathWaypointAction.Jump then
+            part.Color = Color3.fromRGB(100, 150, 255) -- Blue for jump
+        else
+            part.Color = Color3.fromRGB(100, 255, 100) -- Green for normal
+        end
+        
+        part.Parent = workspace
+        table.insert(debugParts, part)
+        
+        -- Add label for waypoint number
+        local billboard = Instance.new("BillboardGui")
+        billboard.Size = UDim2.new(2, 0, 2, 0)
+        billboard.AlwaysOnTop = true
+        billboard.Adornee = part
+        
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.Text = tostring(i)
+        label.TextScaled = true
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.new(1, 1, 1)
+        label.Parent = billboard
+        
+        billboard.Parent = part
+    end
+end
+
+-- Smooth movement function
+local function moveToWaypoint(humanoid, position, jump)
+    humanoid:MoveTo(position)
+    
+    -- Check if we need to jump
+    if jump then
+        humanoid.Jump = true
+    end
+    
+    -- Wait until reached or timeout
+    local startTime = tick()
+    while active and tick() - startTime < MAX_WAYPOINT_TIME do
+        if (position - humanoid.RootPart.Position).Magnitude < WAYPOINT_REACH_DISTANCE then
+            return true
+        end
+        task.wait(0.1)
+    end
+    return false
+end
+
+-- Predictive path calculation
+local function calculatePredictivePath(rootPart, targetRoot)
+    -- Predict target's future position
+    local targetVelocity = targetRoot.AssemblyLinearVelocity
+    local predictedPosition = targetRoot.Position + (targetVelocity * PREDICTION_FACTOR)
+    
+    -- Create path
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 8,  -- Larger spacing for smoother paths
+        Cost = {}
+    })
+    
+    -- Compute path to predicted position
+    path:ComputeAsync(rootPart.Position, predictedPosition)
+    
+    if path.Status == Enum.PathStatus.Success then
+        return path:GetWaypoints()
+    end
+    
+    -- Fallback to current position if prediction fails
+    path:ComputeAsync(rootPart.Position, targetRoot.Position)
+    if path.Status == Enum.PathStatus.Success then
+        return path:GetWaypoints()
+    end
+    
+    return nil
+end
+
+-- Start pathfinding to a player
+local function followPlayer(playerName)
+    -- Clear previous state
+    if connection then
+        connection:Disconnect()
+        connection = nil
+    end
+    clearVisualization()
+    
+    -- Find target player
+    targetPlayer = nil
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Name:lower():find(playerName:lower(), 1, true) then
+            targetPlayer = player
+            break
+        end
+    end
+    
+    if not targetPlayer then
+        warn("Player not found:", playerName)
+        return false
+    end
+    
+    -- Get local player references
+    local player = Players.LocalPlayer
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:WaitForChild("Humanoid")
+    local rootPart = character:WaitForChild("HumanoidRootPart")
+    
+    active = true
+    currentPath = {}
+    currentWaypointIndex = 1
+    lastRecalculation = 0
+    lastTargetPosition = Vector3.new(0, 0, 0)
+    
+    connection = RunService.Heartbeat:Connect(function(deltaTime)
+        if not active then return end
+        if not humanoid or humanoid.Health <= 0 then 
+            active = false
+            return 
+        end
+        
+        -- Check if target is still valid
+        if not targetPlayer or not targetPlayer.Parent or not targetPlayer.Character then
+            active = false
+            return
+        end
+        
+        local targetChar = targetPlayer.Character
+        local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+        if not targetRoot then 
+            active = false
+            return 
+        end
+        
+        -- Check if we've reached the target
+        local distanceToTarget = (targetRoot.Position - rootPart.Position).Magnitude
+        if distanceToTarget < TARGET_REACH_DISTANCE then
+            humanoid:MoveTo(targetRoot.Position)
+            return
+        end
+        
+        -- Check if we need to recalculate the path
+        local now = tick()
+        local targetMoved = (lastTargetPosition - targetRoot.Position).Magnitude > 5
+        if #currentPath == 0 or now - lastRecalculation > RECALCULATE_INTERVAL or targetMoved then
+            -- Recalculate path
+            lastRecalculation = now
+            lastTargetPosition = targetRoot.Position
+            
+            local newWaypoints = calculatePredictivePath(rootPart, targetRoot)
+            
+            if newWaypoints and #newWaypoints > 0 then
+                currentPath = newWaypoints
+                currentWaypointIndex = 1
+                visualizePath(currentPath)
+                
+                -- Skip waypoints we've already passed
+                while currentWaypointIndex <= #currentPath do
+                    local waypoint = currentPath[currentWaypointIndex]
+                    if (waypoint.Position - rootPart.Position).Magnitude < (WAYPOINT_REACH_DISTANCE * 2) then
+                        currentWaypointIndex += 1
+                    else
+                        break
+                    end
+                end
+            end
+        end
+        
+        -- Follow current waypoint
+        if currentWaypointIndex <= #currentPath then
+            local waypoint = currentPath[currentWaypointIndex]
+            local reached = moveToWaypoint(humanoid, waypoint.Position, waypoint.Action == Enum.PathWaypointAction.Jump)
+            
+            if reached or (waypoint.Position - rootPart.Position).Magnitude < WAYPOINT_REACH_DISTANCE then
+                currentWaypointIndex += 1
+            end
+        else
+            -- Move directly if we have no path
+            humanoid:MoveTo(targetRoot.Position)
+        end
+    end)
+    
+    return true
+end
+
+-- Stop pathfinding
+local function stopFollowing()
+    active = false
+    if connection then
+        connection:Disconnect()
+        connection = nil
+    end
+    clearVisualization()
+end
+
+-- Command interface
+return {
+    follow = followPlayer,
+    stop = stopFollowing,
+    toggleDebug = function() DEBUG_VISUAL = not DEBUG_VISUAL end
+}
